@@ -6,14 +6,14 @@
  * func : 数据库
  * history:
 '''
-import pymongo,json,copy,logging
+import pymongo,json,copy,logging, pymysql
 from bson import ObjectId
 from bson import json_util
 from datetime import datetime
 from urllib import unquote
-from mecloud.model.MeObject import *
-from mecloud.model.MeError import *
-from mecloud.lib import *
+from model.MeObject import *
+from model.MeError import *
+from lib import *
 from Util import *
 
 # 基类
@@ -84,7 +84,7 @@ class Db:
 ## MongoDb封装
 class MongoDb(Db):
     @staticmethod
-    def connect(addr, port = 27017, replica_set=None, user=None, password=None):
+    def connect(addr, port = None, replica_set=None, user=None, password=None):
         if isinstance(addr, str) or isinstance(addr, unicode):
             if not port:
                 Db.conn = pymongo.MongoClient(addr)
@@ -232,11 +232,6 @@ class MongoDb(Db):
             obj["_sid"] = MongoDb.toId(obj['_id'])
             obj['_id'] = ObjectId(obj['_id'])
 
-        if 'updateAt' not in obj:
-            obj['updateAt'] = datetime.now()
-            if 'createAt' not in obj:
-                obj['createAt'] = obj['updateAt']
-
         try:
             obj['_id'] =  MongoDb.toId(self.db[collection].insert(MongoDb.toBson(obj)))
             if '_sid' not in obj:
@@ -255,8 +250,13 @@ class MongoDb(Db):
 
     ### 删除
     def remove(self, collection, query):
-        self.db[collection].remove(MongoDb.toBson(query))
-        return True
+        result =  self.db[collection].remove(MongoDb.toBson(query))
+        if result['n'] == 0:
+            log.err('remove[%s: %s] not found', collection, json.dumps(query))
+            e = copy.deepcopy(ERR_NOTFOUND)
+            e.message['errMsg'] = "remove[%s: %s] not found"%(collection, json.dumps(query))
+            raise e
+        return result
 
     def updateOne(self, collection, query, obj, transactions=None, upsert=False):
         # if action==None:
@@ -326,32 +326,18 @@ class MongoDb(Db):
         else:
             return_doc = pymongo.ReturnDocument.BEFORE
 
-
         doc = self.db[collection].find_one_and_update(MongoDb.toBson(query), obj, upsert=upsert, return_document= return_doc);
         if not doc:
             # 如果upsert为True， 则返回新创建数据的id
             if upsert:
                 doc = self.find_one(collection, query)
-                obj={}
-                if '_sid' not in doc:
-                    obj["_sid"]=str(doc['_id'])
                 if 'createAt' not in doc:
-                    obj['createAt']=doc['updateAt']
-                if obj:
-                    doc = self.updateOneOnly(collection,{"_id":doc['_id']}, {'$set': obj})
+                    doc = self.updateOneOnly(collection,{"_id":doc['_id']}, {'$set': {'createAt': doc['updateAt'], "_sid": str(doc['_id'])}})
                 if doc:
                     return {'_id': doc['_id']}
             log.err('update[%s: %s] not found:%s', collection, json.dumps(query), json.dumps(obj))
             raise copy.deepcopy(ERR_NOTFOUND)
-        else:
-            obj = {}
-            if '_sid' not in doc:
-                obj["_sid"] = str( doc['_id'] )
-            if 'updateAt' not in doc:
-                obj['updateAt'] = datetime.now()
-                obj['createAt'] = obj['updateAt']
-            if obj:
-                doc = self.updateOneOnly( collection, {"_id": doc['_id']}, {'$set': obj}, upsert=False)
+
         if '__transaction' in doc:
             del(doc['__transaction'])
         return MongoDb.toJson(doc)
@@ -384,8 +370,6 @@ class MongoDb(Db):
     ### 设置索引, eg. [("date", DESCENDING), ("author", ASCENDING)]
     def index(self, collection, query, **kwargs):
         self.db[collection].create_index(query, **kwargs);
-
-    ### 查看索引
     def listIndex(self, collection):
         result = []
         items = self.db[collection].list_indexes()
@@ -393,6 +377,8 @@ class MongoDb(Db):
             result.append(item['key'])
         return result
 
+    def dropIndex(self, collection, query):
+        self.db[collection].drop_index(query)
     ### 唯一索引
     def unique(self, collection, key):
         self.db[collection].ensure_index(key, unique=True)
@@ -400,7 +386,7 @@ class MongoDb(Db):
     ### ObjectId转换为字符串
     @staticmethod
     def toId(oid):
-        if type(oid) == unicode  or type(oid) == dict or type(oid) == str:
+        if type(oid) == unicode  or type(oid) == dict:
             return oid
         id = eval(json_util.dumps(oid))
         return id['$oid']
@@ -468,7 +454,7 @@ class MongoDb(Db):
                     except:
                         item[key] = datetime.strptime(value.split('.')[0], "%Y-%m-%d %H:%M:%S")
             obj['createAt'] = item
-        if obj.has_key("shotTime") and obj['shotTime']:
+        if obj.has_key("shotTime"):
             obj['shotTime'] = datetime.strptime(obj['shotTime'].split('.')[0], "%Y-%m-%d %H:%M:%S")
         return obj
 
@@ -518,8 +504,111 @@ class MongoDb(Db):
 
 ## MySql封装
 class MySqlDb(Db):
-    def __init__(self, dbName):
+    def __init__(self, dbName=None):
         Db.__init__(self, dbName)
+        Db.conn.select_db(self.dbName())
+        self.db = Db.conn
+        self.cursor = Db.conn.cursor()
+
+    @staticmethod
+    def connect(addr, port = None, user=None, password=None):
+        if not port:
+            port = 3306
+        Db.conn = pymysql.connect(host=addr, port=port, user=user,
+                                  password=password, charset='utf8mb4',
+                                  cursorclass=pymysql.cursors.DictCursor)
+
+    """
+        查询一条
+    """
+    def find_one(self, collection, query, keys="*"):
+        try:
+            sql = "select {0} from {1}".format(keys,collection)
+            if not query:
+                sql += " where {0}".format(self.dict2str(query,","))
+            self.cursor.execute(sql)
+            result = self.cursor.fetchone()
+            print result
+        except Exception,e:
+            print e
+            log.err("find_one err:%s", e)
+    def find(self, collection, query, keys="*", sort=None, limit=8, skip=0):
+        try:
+            sql = "select {0} from {1}".format(keys, collection)
+            if not query:
+                sql += " where {0} limit {1},{2}".format(self.dict2str(query,","), skip, limit)
+            self.cursor.execute(sql)
+            result = self.cursor.fetchmany(limit)
+            print result
+        except Exception,e:
+
+            log.err("find err:%s",e)
+
+    def updateOne(self, collection, query, obj):
+        try:
+            if not obj.has_key("update_date"):
+                obj["update_date"] = "now()"
+            sql = "update {0} set {1} where {2}".format(collection, self.dict2str(obj,","), self.dict2str(query,","))
+            result = self.cursor.execute(sql)
+            self.db.commit()
+            print result
+        except Exception,e:
+            log.err("updateOne err:%s",e)
+
+    def insertOne(self, collection, obj):
+        try:
+            if not obj.has_key('create_date'):
+                obj["create_date"] = "now()"
+                obj["update_date"] = obj["create_date"]
+            sql = "insert into {0} set {1}".format(collection,self.dict2str(obj,","))
+            result = self.cursor.execute(sql)
+            self.db.commit()
+            print result
+        except Exception,e:
+            self.db.rollback()
+            log.err("insert err:%s",e)
+
+    def safe(self,s):
+        return pymysql.escape_string(s)
+    """
+        将json串的key和value转化为字符串
+    """
+    def dict2str(self, dictin, joinString):
+        '''
+            将字典变成，key='value',key='value' 的形式
+            '''
+        tmplist = []
+        for k, v in dictin.items():
+            if v == "now()":  # 当前时间
+                tmp = "%s=%s" % (str(k), str(v))
+            elif type(v) is str:
+                tmp = "%s='%s'" % (str(k), str(v))
+            else:
+                tmp = "%s=%s" % (str(k), str(v))
+            tmplist.append(' ' + tmp + ' ')
+        return joinString.join(tmplist)
+    # """
+    #     将json串的key和value分别转化为字符串
+    # """
+    # def dictToString(self,obj,joinString):
+    #     return joinString.join(obj.keys()),joinString.join([self.convert(x) for x in obj.values()])
+
+    """
+    转化为字符串，字符串添加单引号
+    """
+    # def convert(self,value):
+    #     if value == "now()":#当前时间
+    #         return value
+    #     if type(value) is str:
+    #         return "'" + value + "'"
+    #     else:
+    #         return str(value)
+
+    def close(self):
+        self.cursor.close()
+        Db.conn.close()
+
+
 
 
 ## SqlServer封装
